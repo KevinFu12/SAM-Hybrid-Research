@@ -1,0 +1,10 @@
+opencv-python
+numpy
+pandas
+torch
+transformers
+tqdm
+Pillow
+scipy
+segment-anything @ git+https://github.com/facebookresearch/segment-anything.git
+openai

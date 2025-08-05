@@ -18,7 +18,7 @@ Dataset digunakan dari HuggingFace (berlisensi non-komersial).
 
 ```bash
 git clone https://github.com/nama-kamu/dfu-hybrid-segmentation.git
-cd dfu-hybrid-segmentation
+cd SAM-Hybrid-Research
 ```
 
 2. Buat environment dan install dependensi:
@@ -32,7 +32,7 @@ pip install -r requirements.txt
 4. Set environment variable untuk OpenAI API:
 
 ```bash
-export OPENAI_API_KEY=your_api_key_here
+export OPENAI_API_KEY = your_api_key_here
 ```
 
 ## Menjalankan Pipeline

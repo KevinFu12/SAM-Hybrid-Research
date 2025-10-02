@@ -38,7 +38,7 @@ A comprehensive pipeline for automated segmentation of diabetic foot ulcers usin
 
 ```bash
 git clone <your-repo-url>
-cd diabetic-foot-ulcer-segmentation
+cd SAM-Hybrid-Research
 ```
 
 ### 2. Install Dependencies

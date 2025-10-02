@@ -1,67 +1,93 @@
 import os
 import cv2
+import argparse
 import numpy as np
 import pandas as pd
-import argparse
-from segment_anything import sam_model_registry, SamAutomaticMaskGenerator
-from utils import compute_dice_iou, compute_hausdorff
+from tqdm import tqdm
 
-# Argument Parser
-parser = argparse.ArgumentParser(description="Run SAM Automatic Evaluation")
-parser.add_argument("--image_dir", type=str, required=True, help="Path to input images")
-parser.add_argument("--mask_dir", type=str, required=True, help="Path to ground truth masks")
-parser.add_argument("--output_csv", type=str, default="sam_auto_eval_results.csv", help="Path to save result CSV")
-args = parser.parse_args()
+from config import SAM_CHECKPOINT, SAM_MODEL_TYPE, device, DICE_SUCCESS_THRESHOLD
+from sam_segmenter import SAMSegmenter
+from evaluator import Evaluator
+from utils import load_image_mask
 
-# Load SAM
-sam_checkpoint = "/content/sam_vit_b.pth"
-model_type = "vit_b"
-device = "cuda" if cv2.cuda.getCudaEnabledDeviceCount() > 0 else "cpu"
-sam = sam_model_registry[model_type](checkpoint=sam_checkpoint).to(device)
+def main():
+    parser = argparse.ArgumentParser(description="Run SAM Automatic Evaluation")
+    parser.add_argument("--image_dir", type=str, required=True, help="Path to input images")
+    parser.add_argument("--mask_dir", type=str, required=True, help="Path to ground truth masks")
+    parser.add_argument("--output_dir", type=str, default="./results_sam_auto", help="Path to save results")
+    args = parser.parse_args()
 
-mask_generator = SamAutomaticMaskGenerator(
-    model=sam,
-    points_per_side=32,
-    pred_iou_thresh=0.88,
-    stability_score_thresh=0.95,
-    crop_n_layers=0,
-    min_mask_region_area=100
-)
+    # Initialize components
+    sam_segmenter = SAMSegmenter()
+    evaluator = Evaluator()
 
-image_files = sorted([f for f in os.listdir(args.image_dir) if f.lower().endswith(('.jpg', '.png'))])
-results = []
+    os.makedirs(args.output_dir, exist_ok=True)
+    results = []
+    image_files = sorted([f for f in os.listdir(args.image_dir) if f.lower().endswith(('.jpg', '.png'))])
 
-for img_file in image_files:
-    img_path = os.path.join(args.image_dir, img_file)
-    mask_path = os.path.join(args.mask_dir, img_file)
+    if len(image_files) == 0:
+        print(f"No images found in {args.image_dir}")
+        return
 
-    if not os.path.exists(mask_path):
-        continue
+    print(f"Processing {len(image_files)} images...")
 
-    # Pre-processing
-    # Baca gambar dan normalisasi nilai piksel ke [0, 1]
-    image = cv2.imread(img_path).astype(np.float32) / 255.0
-    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    
-    # Baca ground truth mask dan ubah jadi biner (0/1)
-    gt_mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
-    gt_mask = (gt_mask > 127).astype(np.uint8)
+    for img_file in tqdm(image_files, desc="SAM Auto Segmentation"):
+        try:
+            # Load image and mask
+            image_path = os.path.join(args.image_dir, img_file)
+            mask_path = os.path.join(args.mask_dir, img_file)
+            
+            if not os.path.exists(mask_path):
+                print(f"Warning: Ground truth mask not found for {img_file}, skipping...")
+                continue
+            
+            image_np, gt_mask = load_image_mask(image_path, mask_path)
+            
+            # SAM auto-masking
+            sam_segmenter.set_image((image_np * 255).astype(np.uint8))
+            pred_mask = sam_segmenter.auto_mask()
+            
+            # Evaluation
+            dice, iou, hausdorff, status = evaluator.evaluate_segmentation(pred_mask, gt_mask)
+            
+            # Save predicted mask
+            output_path = os.path.join(args.output_dir, img_file.replace(".jpg", "_mask.png").replace(".png", "_mask.png"))
+            cv2.imwrite(output_path, pred_mask * 255)
 
-    # Segmentasi dengan SAM
-    masks = mask_generator.generate((image * 255).astype(np.uint8))
-    combined_mask = np.zeros_like(gt_mask, dtype=np.uint8)
+            results.append({
+                "Image": img_file,
+                "Dice": dice,
+                "IoU": iou,
+                "Hausdorff": hausdorff,
+                "Status": status
+            })
 
-    for m in masks:
-        combined_mask |= m['segmentation'].astype(np.uint8)
+        except Exception as e:
+            print(f"Error processing {img_file}: {e}")
+            results.append({
+                "Image": img_file,
+                "Dice": 0.0,
+                "IoU": 0.0,
+                "Hausdorff": np.inf,
+                "Status": "ERROR"
+            })
+            continue
 
-    # Post-processing
-    # Gabungkan semua mask SAM → lalu binarisasi hasil segmentasi
-    pred_mask = (combined_mask >= 1).astype(np.uint8)
-    
-    # Evaluasi
-    dice, iou = compute_dice_iou(pred_mask, gt_mask)
-    hausdorff = compute_hausdorff(pred_mask, gt_mask)
-    results.append((img_file, dice, iou, hausdorff))
+    # Save results
+    df = pd.DataFrame(results)
+    csv_path = os.path.join(args.output_dir, "sam_auto_results.csv")
+    df.to_csv(csv_path, index=False)
 
-df = pd.DataFrame(results, columns=["Image", "Dice", "IoU", "Hausdorff"])
-df.to_csv(args.output_csv, index=False)
+    print(f"\n{'='*60}")
+    print(f"SAM Auto Evaluation Complete")
+    print(f"{'='*60}")
+    print(f"Results saved to: {args.output_dir}")
+    print(f"Total images processed: {len(df)}")
+    print(f"Average Dice: {df['Dice'].mean():.3f}")
+    print(f"Average IoU: {df['IoU'].mean():.3f}")
+    print(f"Average Hausdorff: {df['Hausdorff'].replace([np.inf], np.nan).mean():.2f}")
+    print(f"Successful segmentations (Dice >= {DICE_SUCCESS_THRESHOLD}): {len(df[df['Status'] == 'OK'])}/{len(df)}")
+    print(f"{'='*60}\n")
+
+if __name__ == "__main__":
+    main()

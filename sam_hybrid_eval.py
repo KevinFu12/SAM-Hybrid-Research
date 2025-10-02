@@ -1,160 +1,163 @@
 import os
 import cv2
 import gc
-import torch
 import argparse
 import numpy as np
 import pandas as pd
 from PIL import Image
 from tqdm import tqdm
-from openai import OpenAI
-from segment_anything import sam_model_registry, SamPredictor
-from transformers import OwlViTProcessor, OwlViTForObjectDetection
-from utils import compute_dice_iou, compute_hausdorff
-import base64
-import io
-import random
 
-# Argument Parser
-parser = argparse.ArgumentParser(description="Run Hybrid GPT-4o + OWL-ViT + SAM Evaluation")
-parser.add_argument("--image_dir", type=str, required=True, help="Path to input images")
-parser.add_argument("--gt_mask_dir", type=str, required=True, help="Path to ground truth masks")
-parser.add_argument("--output_dir", type=str, default="/content/results_DFUC2022", help="Path to save results")
-args = parser.parse_args()
+from config import *
+from gpt_prompter import ask_gpt_prompt, is_plural_wound, validate_gpt_response
+from owlvit_detector import OwlViTDetector
+from sam_segmenter import SAMSegmenter
+from fallback_ensemble import FallbackEnsemble
+from evaluator import Evaluator
+from utils import load_image_mask
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
-client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+def main():
+    parser = argparse.ArgumentParser(description="Run Hybrid GPT-4o + OWL-ViT + SAM Evaluation")
+    parser.add_argument("--image_dir", type=str, required=True, help="Path to input images")
+    parser.add_argument("--gt_mask_dir", type=str, required=True, help="Path to ground truth masks")
+    parser.add_argument("--output_dir", type=str, default="./results_hybrid", help="Path to save results")
+    parser.add_argument("--max_attempts", type=int, default=3, help="Max attempts per image with GPT-4o")
+    args = parser.parse_args()
 
-sam_checkpoint = "/content/sam_vit_b.pth"
-model_type = "vit_b"
-sam = sam_model_registry[model_type](checkpoint=sam_checkpoint).to(device)
-predictor = SamPredictor(sam)
+    # Initialize components
+    print("Initializing models...")
+    owl_detector = OwlViTDetector()
+    sam_segmenter = SAMSegmenter()
+    fallback_ensemble = FallbackEnsemble(owl_detector, sam_segmenter)
+    evaluator = Evaluator()
 
-owl_processor = OwlViTProcessor.from_pretrained("google/owlvit-base-patch32")
-owl_model = OwlViTForObjectDetection.from_pretrained("google/owlvit-base-patch32").to(device)
+    os.makedirs(args.output_dir, exist_ok=True)
+    results = []
+    image_files = sorted([f for f in os.listdir(args.image_dir) if f.lower().endswith(('.jpg', '.png'))])
 
-medical_prompts = [
-    "foot ulcer", "pink area", "peeling skin", "open wound on foot",
-    "red wound on heel", "diabetic skin lesion", "inflamed ulcer on foot"
-]
+    if len(image_files) == 0:
+        print(f"No images found in {args.image_dir}")
+        return
 
-def encode_numpy_image_to_base64(image_np):
-    img_pil = Image.fromarray((image_np * 255).astype(np.uint8))
-    buffered = io.BytesIO()
-    img_pil.save(buffered, format="PNG")
-    return base64.b64encode(buffered.getvalue()).decode("utf-8")
+    print(f"Processing {len(image_files)} images with up to {args.max_attempts} attempts each...\n")
 
-def ask_gpt_prompt(image_np):
-    base64_image = encode_numpy_image_to_base64(image_np)
-    messages = [{
-        "role": "user",
-        "content": [
-            {"type": "text", "text": (
-                "You are a medical imaging expert. Describe any visible wounds on this diabetic foot. "
-                "Include location, severity, color, and shape. Respond with one sentence.")},
-            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{base64_image}"}}
-        ]
-    }]
-    try:
-        response = client.chat.completions.create(
-            model="gpt-4o", messages=messages, max_tokens=100
-        )
-        return response.choices[0].message.content.strip()
-    except Exception as e:
-        print("❗ GPT-4o Error:", e)
-        return random.choice(medical_prompts)
+    for img_file in tqdm(image_files, desc="Hybrid Segmentation"):
+        best_dice, best_iou, best_hausdorff = 0.0, 0.0, np.inf
+        best_status = "FN"
+        best_prompt = ""
+        best_plural_flag = "singular"
+        best_num_boxes = 0
+        best_mask = None
+        used_ensemble = False
 
-def is_plural_wound(prompt):
-    return any(word in prompt.lower() for word in ["multiple", "several", "many", "wounds", "ulcers", "lesions"])
+        for attempt in range(args.max_attempts):
+            try:
+                # Load image and mask
+                image_path = os.path.join(args.image_dir, img_file)
+                mask_path = os.path.join(args.gt_mask_dir, img_file)
+                
+                if not os.path.exists(mask_path):
+                    print(f"Warning: Ground truth mask not found for {img_file}, skipping...")
+                    break
+                
+                image_np, gt_mask = load_image_mask(image_path, mask_path)
+                
+                # GPT-4o prompt generation
+                gpt_prompt = ask_gpt_prompt(image_np)
+                gpt_prompt = validate_gpt_response(gpt_prompt)
+                plural_flag = is_plural_wound(gpt_prompt)
+                
+                # Prepare prompts for OWL-ViT
+                prompts = owl_detector.prepare_prompts(gpt_prompt, MEDICAL_PROMPTS)
+                image_pil = Image.fromarray((image_np * 255).astype(np.uint8))
+                
+                # Object detection with OWL-ViT
+                results_owl = owl_detector.detect_objects(image_pil, prompts)
+                
+                # SAM segmentation
+                sam_segmenter.set_image((image_np * 255).astype(np.uint8))
+                
+                if len(results_owl["boxes"]) > 0:
+                    # Pass both boxes and scores to SAM
+                    final_mask = sam_segmenter.predict_from_boxes(
+                        results_owl["boxes"],
+                        results_owl["scores"],
+                        plural_flag
+                    )
+                else:
+                    final_mask = sam_segmenter.auto_mask()
+                
+                # Initial evaluation
+                dice, iou, hausdorff, status = evaluator.evaluate_segmentation(final_mask, gt_mask)
+                
+                # Apply refinement if needed
+                ensemble_used = False
+                if dice < DICE_REFINEMENT_THRESHOLD:
+                    ensemble_mask, ensemble_dice, ensemble_iou, ensemble_hausdorff = (
+                        fallback_ensemble.refine_segmentation(
+                            image_pil, image_np, dice, gt_mask, evaluator
+                        )
+                    )
+                    
+                    if ensemble_mask is not None and ensemble_dice > dice:
+                        final_mask = ensemble_mask
+                        dice, iou, hausdorff = ensemble_dice, ensemble_iou, ensemble_hausdorff
+                        status = "OK" if dice >= DICE_SUCCESS_THRESHOLD else "FN"
+                        ensemble_used = True
 
-os.makedirs(args.output_dir, exist_ok=True)
-results = []
-image_files = sorted([f for f in os.listdir(args.image_dir) if f.lower().endswith(('.jpg', '.png'))])
+                # Update best results
+                if dice > best_dice:
+                    best_dice, best_iou, best_hausdorff = dice, iou, hausdorff
+                    best_status = status
+                    best_prompt = gpt_prompt
+                    best_plural_flag = "plural" if plural_flag else "singular"
+                    best_num_boxes = len(results_owl["boxes"])
+                    best_mask = final_mask.copy()
+                    used_ensemble = ensemble_used
 
-for img_file in tqdm(image_files):
-    print(f"Processing {img_file}")
-    best_dice, best_iou, best_hausdorff = 0.0, 0.0, np.inf
-    best_status = "FN"
-    best_prompt = ""
-    best_plural_flag = "singular"
-    best_num_boxes = 0
-    best_mask = None
+            except Exception as e:
+                print(f"Error in attempt {attempt + 1} for {img_file}: {e}")
+                continue
+            
+            finally:
+                gc.collect()
 
-    for attempt in range(3):
-        print(f"Attempt {attempt + 1}")
-        
-        # Pre-processing
-        # Baca gambar RGB dan normalisasi piksel ke [0, 1]
-        image = cv2.cvtColor(cv2.imread(os.path.join(args.image_dir, img_file)), cv2.COLOR_BGR2RGB)
-        image = image.astype(np.float32) / 255.0
+        # Save best mask
+        if best_mask is not None:
+            output_path = os.path.join(args.output_dir, img_file.replace(".jpg", "_mask.png").replace(".png", "_mask.png"))
+            cv2.imwrite(output_path, best_mask * 255)
+        else:
+            print(f"Warning: No valid mask generated for {img_file}")
+            best_dice, best_iou, best_hausdorff = 0.0, 0.0, np.inf
+            best_status = "ERROR"
 
-        # Baca mask ground truth dan binarisasi
-        mask = cv2.imread(os.path.join(args.gt_mask_dir, img_file), cv2.IMREAD_GRAYSCALE)
-        if image is None or mask is None:
-            print("Skipped: missing image or mask")
-            continue
-        gt_mask = (mask > 127).astype(np.uint8)
+        results.append({
+            "Image": img_file,
+            "Prompt": best_prompt,
+            "WoundPlurality": best_plural_flag,
+            "NumBoxes": best_num_boxes,
+            "Dice": best_dice,
+            "IoU": best_iou,
+            "Hausdorff": best_hausdorff,
+            "Status": best_status,
+            "UsedEnsemble": used_ensemble
+        })
 
-        # Prompt generation dari GPT-4o
-        gpt_prompt = ask_gpt_prompt(image)
-        if any(x in gpt_prompt.lower() for x in ["sorry", "can't", "unsure"]):
-            gpt_prompt = random.choice(medical_prompts)
+    # Save results
+    df = pd.DataFrame(results)
+    csv_path = os.path.join(args.output_dir, "hybrid_results.csv")
+    df.to_csv(csv_path, index=False)
 
-        plural_flag = is_plural_wound(gpt_prompt)
-        prompt_list = [gpt_prompt] + medical_prompts
-        
-        # OWL-ViT: Deteksi objek berdasarkan prompt
-        inputs = owl_processor(text=prompt_list, images=Image.fromarray((image * 255).astype(np.uint8)), return_tensors="pt").to(device)
-        with torch.no_grad():
-            outputs = owl_model(**inputs)
+    print(f"\n{'='*60}")
+    print(f"Hybrid Evaluation Complete")
+    print(f"{'='*60}")
+    print(f"Results saved to: {args.output_dir}")
+    print(f"Total images processed: {len(df)}")
+    print(f"Average Dice: {df['Dice'].mean():.3f}")
+    print(f"Average IoU: {df['IoU'].mean():.3f}")
+    print(f"Average Hausdorff: {df['Hausdorff'].replace([np.inf], np.nan).mean():.2f}")
+    print(f"Successful segmentations (Dice >= {DICE_SUCCESS_THRESHOLD}): {len(df[df['Status'] == 'OK'])}/{len(df)}")
+    print(f"Ensemble methods used: {df['UsedEnsemble'].sum()} images")
+    print(f"{'='*60}\n")
 
-        target_sizes = torch.tensor([image.shape[:2]]).to(device)
-        results_owl = owl_processor.post_process_grounded_object_detection(
-            outputs=outputs, target_sizes=target_sizes, threshold=0.01)[0]
-
-        if len(results_owl["boxes"]) == 0:
-            continue
-        
-        # SAM Prediction
-        predictor.set_image((image * 255).astype(np.uint8))
-        final_mask = np.zeros(image.shape[:2], dtype=np.uint8)
-
-        topk = min(5, len(results_owl["scores"])) if plural_flag else 1
-        for idx in results_owl["scores"].argsort(descending=True)[:topk]:
-            box = results_owl["boxes"][idx].int().tolist()
-            masks, _, _ = predictor.predict(box=np.array(box), multimask_output=False)
-            pred = (masks[0] >= 0.5).astype(np.uint8)
-            final_mask = np.logical_or(final_mask, pred)
-
-        # Post-processing
-        # Finalisasi hasil prediksi menjadi mask 0/1
-        final_mask = final_mask.astype(np.uint8)
-        
-        # Evaluasi
-        dice, iou = compute_dice_iou(final_mask, gt_mask)
-        hausdorff = compute_hausdorff(final_mask, gt_mask)
-        status = "OK" if dice >= 0.1 else "FN"
-
-        if dice > best_dice:
-            best_dice, best_iou, best_hausdorff = dice, iou, hausdorff
-            best_status = status
-            best_prompt = gpt_prompt
-            best_plural_flag = "plural" if plural_flag else "singular"
-            best_num_boxes = len(results_owl["boxes"])
-            best_mask = final_mask.copy()
-
-        del final_mask, masks
-        gc.collect()
-
-    if best_mask is not None:
-        cv2.imwrite(os.path.join(args.output_dir, img_file.replace(".png", "_mask.png")), best_mask * 255)
-
-    results.append((
-        img_file, best_prompt, best_plural_flag, best_num_boxes,
-        best_dice, best_iou, best_hausdorff, best_status
-    ))
-
-df = pd.DataFrame(results, columns=[
-    "Image", "Prompt", "WoundPlurality", "NumBoxes", "Dice", "IoU", "Hausdorff", "Status"
-])
-df.to_csv(os.path.join(args.output_dir, "hybrid_results.csv"), index=False)
+if __name__ == "__main__":
+    main()
